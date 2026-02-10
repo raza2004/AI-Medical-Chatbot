@@ -1,4 +1,5 @@
 import os
+import sys
 import requests
 import re
 import json
@@ -6,22 +7,26 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 
-from predict import predict_from_text, DISEASE_LIST
+# ✅ ADD THESE LINES - Get the correct base directory
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # Parent of src/
+sys.path.insert(0, BASE_DIR)  # Add to Python path
 
+from predict import predict_from_text, DISEASE_LIST
 from openai import OpenAI
 
 load_dotenv()
 
-
-DATA_FILE = "data.json"
+# ✅ UPDATE DATA_FILE path to use BASE_DIR
+DATA_FILE = os.path.join(BASE_DIR, "data.json")
 
 with open(DATA_FILE, "r", encoding="utf-8") as f:
     ALL_DOCTORS = json.load(f)
     AVAILABLE_SPECIALTIES = sorted({
-    d["specialty"].strip().lower()
-    for d in ALL_DOCTORS
-    if d.get("specialty")
-})
+        d["specialty"].strip().lower()
+        for d in ALL_DOCTORS
+        if d.get("specialty")
+    })
+
 
 
 LOCATIONIQ_API_KEY = os.getenv("LOCATIONIQ_API_KEY")
@@ -445,3 +450,5 @@ def doctors():
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000, debug=True)
+    # ✅ ADD THIS - Required for Vercel
+app = app 
