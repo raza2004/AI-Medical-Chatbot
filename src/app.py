@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # Parent of src/
 sys.path.insert(0, BASE_DIR)  # Add to Python path
 
-from predict import predict_from_text, DISEASE_LIST
+from predict import predict_from_text, predict_from_symptoms, DISEASE_LIST, SYMPTOM_COLS_LIST
 from openai import OpenAI
 
 load_dotenv()
@@ -219,61 +219,188 @@ def home():
     return jsonify({"message": "HealthNexus backend running"})
 
 
-def is_clear_from_dataset(symptom_text: str) -> bool:
-    # Simple heuristic: if user typed very few words, or text is too vague → not clear
-    t = (symptom_text or "").strip().lower()
-    if len(t.split()) < 3:
-        return False
-    return True  # replace later with a real confidence score if you add one
+def normalize_symptoms_with_openai(symptom_text: str) -> list[str]:
+    """
+    Used ONLY when our CSV/ML matcher found nothing in the raw text.
+    Asks OpenAI to map the user's free text (synonyms, slang, another
+    language, etc.) onto our EXACT known symptom vocabulary
+    (SYMPTOM_COLS_LIST, from Training.csv), so we can re-try the real
+    CSV-based model instead of guessing a disease directly.
+    """
+    if not OPENAI_API_KEY:
+        return []
+
+    vocab_str = ", ".join(SYMPTOM_COLS_LIST)
+
+    prompt = f"""
+A user describes symptoms, possibly using synonyms, slang, or another
+language:
+
+\"\"\"{symptom_text}\"\"\"
+
+Here is our EXACT list of known symptom names:
+
+{vocab_str}
+
+Map the user's description to the matching symptom names from that list
+ONLY. Do not invent new names and do not include anything not in the list.
+If nothing in the list matches, return NONE.
+
+Return ONLY a comma-separated list of matching symptom names exactly as
+spelled in the list above, or the single word NONE.
+"""
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You only return exact items from the provided list, comma-separated, or NONE.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            max_tokens=100,
+        )
+
+        text = resp.choices[0].message.content.strip()
+        if not text or text.strip().upper() == "NONE":
+            return []
+
+        candidates = [c.strip() for c in text.split(",") if c.strip()]
+        # keep only symptoms that really exist in our vocabulary
+        return [c for c in candidates if c in SYMPTOM_COLS_LIST]
+
+    except Exception as e:
+        print("OpenAI symptom normalization error:", e)
+        return []
+
+
+def get_ai_insight_for_prediction(disease: str, symptoms: list[str]) -> dict:
+    """
+    Even when OUR CSV/ML model already found a disease, still ask OpenAI
+    for a short plain-language insight on that specific prediction, plus
+    a couple of extra practical tips. This is additive context on top of
+    the model's own result, never a replacement diagnosis.
+    """
+    if not OPENAI_API_KEY:
+        return {"ai_explanation": "", "ai_suggestions": []}
+
+    symptoms_str = ", ".join(s.replace("_", " ") for s in symptoms) or "the symptoms described"
+
+    prompt = f"""
+Our internal model predicted "{disease}" as a possible condition based on
+these matched symptoms: {symptoms_str}.
+
+In plain language:
+1. Briefly explain (2-3 sentences) what this condition generally is and
+   why these symptoms can relate to it. Make clear this came from a
+   limited internal model, not a doctor's diagnosis.
+2. Give 2-3 short, practical tips (home care, when to see a doctor, warning
+   signs to watch for).
+
+Return plain text: first the explanation, then the tips as short lines
+starting with '-'.
+"""
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a cautious medical information assistant giving extra "
+                        "context on a prediction that already came from another model. "
+                        "You never present this as a confirmed diagnosis, and you always "
+                        "recommend consulting a real doctor for anything serious."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+            max_tokens=250,
+        )
+
+        text = resp.choices[0].message.content.strip()
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+
+        suggestions = [l.lstrip("-•* ").strip() for l in lines if l.lstrip().startswith(("-", "•", "*"))]
+        explanation_lines = [l for l in lines if not l.lstrip().startswith(("-", "•", "*"))]
+        explanation = " ".join(explanation_lines).strip()
+
+        return {"ai_explanation": explanation, "ai_suggestions": suggestions}
+
+    except Exception as e:
+        print("OpenAI insight error:", e)
+        return {"ai_explanation": "", "ai_suggestions": []}
+
+
+def _csv_result_to_response(result: dict, normalized: bool = False) -> dict:
+    """Shape a predict_from_text/predict_from_symptoms result into the API's response format."""
+    insight = get_ai_insight_for_prediction(
+        result["predicted_disease"], result.get("input_symptoms", [])
+    )
+
+    return {
+        "ok": True,
+        "predicted_disease": result["predicted_disease"],
+        "ai_diseases": [d["name"] for d in result.get("possible_diseases", [])],
+        "ai_explanation": insight["ai_explanation"],
+        "description": result.get("description", ""),
+        "precautions": result.get("precautions", []),
+        "suggestions": result.get("precautions", []) or insight["ai_suggestions"],
+        "ai_suggestions": insight["ai_suggestions"],
+        "source": "csv_model_normalized" if normalized else "csv_model",
+        "disclaimer": result.get("disclaimer", (
+            "This is not a medical diagnosis. Always consult a qualified doctor "
+            "for any health concerns."
+        )),
+    }
 
 
 @app.route("/predict", methods=["POST"])
 def predict():
     data = request.get_json() or {}
     symptom_text = (data.get("symptoms") or "").strip()
+    days = int(data.get("days") or 1)
 
-    # 1) If internal dataset not clear → AI-only (possible conditions)
-    if not is_clear_from_dataset(symptom_text):
-        ai = suggest_diseases_with_openai(symptom_text)
+    if not symptom_text:
+        return jsonify({"ok": False, "message": "No symptoms provided."}), 400
 
-        return jsonify({
-            "ok": True,
-            "predicted_disease": "Not clear from internal dataset",
-            "ai_diseases": ai["ai_diseases"],               # ✅ show these in UI
-            "ai_explanation": ai["ai_explanation"],
-            "description": "",
-            "precautions": [],
-            "suggestions": ai["ai_suggestions"],
-            "disclaimer": (
-                "This is not a medical diagnosis. These are only possible conditions "
-                "and may be incomplete. Seek urgent care for severe chest pain, trouble "
-                "breathing, fainting, weakness on one side, or worsening symptoms."
-            ),
-        }), 200
+    # 1) Try our own CSV/ML model first, straight from the raw text.
+    csv_result = predict_from_text(symptom_text, days)
+    if csv_result.get("ok"):
+        return jsonify(_csv_result_to_response(csv_result)), 200
 
-    # 2) Otherwise: use your existing logic (AI picks from DISEASE_LIST)
+    # 2) Not matched directly — maybe the wording just doesn't match our
+    #    CSV vocabulary (synonym, slang, another language). Ask OpenAI to
+    #    translate it into our known symptom names, then re-try the CSV model.
+    normalized_symptoms = normalize_symptoms_with_openai(symptom_text)
+    if normalized_symptoms:
+        csv_result = predict_from_symptoms(normalized_symptoms, days)
+        if csv_result.get("ok"):
+            return jsonify(_csv_result_to_response(csv_result, normalized=True)), 200
+
+    # 3) Still nothing in our dataset — this is likely a disease/symptom
+    #    outside our CSV files entirely. Fall back fully to OpenAI, which
+    #    is explicitly told these are only possible conditions, not a diagnosis.
     ai = suggest_diseases_with_openai(symptom_text)
-    primary_disease = ai["ai_diseases"][0] if ai["ai_diseases"] else None
-
-    description, precautions = "", []
-    if primary_disease:
-        from predict import desc_dict, precaution_dict
-        description = desc_dict.get(primary_disease, "")
-        precautions = precaution_dict.get(primary_disease, [])
-
-    suggestions = precautions or ai["ai_suggestions"]
 
     return jsonify({
         "ok": True,
-        "predicted_disease": primary_disease or "Not clear from internal dataset",
+        "predicted_disease": "Not clear from internal dataset",
         "ai_diseases": ai["ai_diseases"],
         "ai_explanation": ai["ai_explanation"],
-        "description": description,
-        "precautions": precautions,
-        "suggestions": suggestions,
+        "description": "",
+        "precautions": [],
+        "suggestions": ai["ai_suggestions"],
+        "source": "openai_fallback",
         "disclaimer": (
             "This is not a medical diagnosis. These are only possible conditions "
-            "from a limited dataset. Always consult a qualified doctor."
+            "and may be incomplete. Seek urgent care for severe chest pain, trouble "
+            "breathing, fainting, weakness on one side, or worsening symptoms."
         ),
     }), 200
 

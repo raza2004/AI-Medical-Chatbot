@@ -141,23 +141,26 @@ def _text_to_symptom_list(text: str):
 
 # ----------------- PUBLIC FUNCTION -----------------
 
-def predict_from_text(symptom_text: str, days: int = 1):
-    """
-    Main function to be used by Flask.
-    Takes a free-text symptom description and number of days,
-    returns a JSON-serializable dict with prediction info.
-    """
+# Exposed so callers (e.g. the AI fallback) know exactly which symptom
+# vocabulary the CSV/model understands.
+SYMPTOM_COLS_LIST = list(SYMPTOM_COLS)
 
-    symptoms = _text_to_symptom_list(symptom_text)
+
+def predict_from_symptoms(symptoms, days: int = 1):
+    """
+    Core CSV/ML prediction. Takes a list of symptom names that already
+    match Training.csv column names (e.g. produced by _text_to_symptom_list,
+    or by the OpenAI normalization fallback) and runs the trained model.
+    """
+    symptoms = [s for s in (symptoms or []) if s in SYMPTOM_COLS_LIST]
 
     # Build 0/1 feature vector
     input_vec = np.zeros(len(SYMPTOM_COLS), dtype=int)
-    col_list = list(SYMPTOM_COLS)
+    col_list = SYMPTOM_COLS_LIST
 
     for s in symptoms:
-        if s in col_list:
-            idx = col_list.index(s)
-            input_vec[idx] = 1
+        idx = col_list.index(s)
+        input_vec[idx] = 1
 
     if not symptoms:
         # no known symptoms from our CSV
@@ -229,5 +232,22 @@ def predict_from_text(symptom_text: str, days: int = 1):
             "for any health concerns."
         ),
     }
-# expose disease list for the app
-__all__ = ["predict_from_text", "DISEASE_LIST"]
+
+
+def predict_from_text(symptom_text: str, days: int = 1):
+    """
+    Main function to be used by Flask.
+    Takes a free-text symptom description and number of days,
+    returns a JSON-serializable dict with prediction info.
+    """
+    symptoms = _text_to_symptom_list(symptom_text)
+    return predict_from_symptoms(symptoms, days)
+
+
+# expose disease list / vocabulary for the app
+__all__ = [
+    "predict_from_text",
+    "predict_from_symptoms",
+    "DISEASE_LIST",
+    "SYMPTOM_COLS_LIST",
+]
